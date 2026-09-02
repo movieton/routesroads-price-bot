@@ -1,6 +1,16 @@
 import unittest
+from datetime import datetime, time
+from zoneinfo import ZoneInfo
 
-from bot import ScanResult, ZeroPriceProduct, format_scan_result, scan_zero_price_products
+from bot import (
+    ScanResult,
+    TelegramBot,
+    ZeroPriceProduct,
+    format_scan_result,
+    parse_schedule_time,
+    parse_target_chat_id,
+    scan_zero_price_products,
+)
 
 
 class ScannerTests(unittest.TestCase):
@@ -63,6 +73,61 @@ class ScannerTests(unittest.TestCase):
         message = format_scan_result(result)[0]
         self.assertIn("A &amp; B &lt;test&gt;", message)
         self.assertIn("S &amp; M", message)
+
+    def test_target_message_can_be_sent_to_a_forum_topic(self):
+        bot = TelegramBot("token", "https://example.com", None)
+        calls = []
+        bot.api_call = lambda method, data, **_kwargs: calls.append((method, data))
+
+        bot.send_message(-1001234567890, "Report", message_thread_id=42)
+
+        self.assertEqual(calls[0][0], "sendMessage")
+        self.assertEqual(calls[0][1]["chat_id"], -1001234567890)
+        self.assertEqual(calls[0][1]["message_thread_id"], 42)
+
+    def test_scheduled_check_runs_once_per_moscow_day(self):
+        bot = TelegramBot(
+            "token",
+            "https://example.com",
+            None,
+            target_chat_id=-1001234567890,
+            target_message_thread_id=42,
+            schedule_time=time(9, 0),
+            timezone=ZoneInfo("Europe/Moscow"),
+        )
+        runs = []
+        bot.run_check = lambda *args, **kwargs: runs.append((args, kwargs))
+        now = datetime(2026, 9, 2, 9, 0, tzinfo=ZoneInfo("Europe/Moscow"))
+
+        bot.run_scheduled_check_if_due(now)
+        bot.run_scheduled_check_if_due(now.replace(hour=10))
+
+        self.assertEqual(len(runs), 1)
+        self.assertEqual(runs[0][0], (-1001234567890, 42))
+        self.assertIn("09:00", runs[0][1]["intro"])
+
+    def test_schedule_does_not_run_before_time(self):
+        bot = TelegramBot(
+            "token",
+            "https://example.com",
+            None,
+            target_chat_id=-1001234567890,
+            schedule_time=time(9, 0),
+            timezone=ZoneInfo("Europe/Moscow"),
+        )
+        runs = []
+        bot.run_check = lambda *args, **kwargs: runs.append((args, kwargs))
+
+        bot.run_scheduled_check_if_due(
+            datetime(2026, 9, 2, 8, 59, tzinfo=ZoneInfo("Europe/Moscow"))
+        )
+
+        self.assertEqual(runs, [])
+
+    def test_parses_target_and_schedule_settings(self):
+        self.assertEqual(parse_target_chat_id("-1001234567890"), -1001234567890)
+        self.assertEqual(parse_target_chat_id("@routesroads_channel"), "@routesroads_channel")
+        self.assertEqual(parse_schedule_time("09:00"), time(9, 0))
 
 
 if __name__ == "__main__":

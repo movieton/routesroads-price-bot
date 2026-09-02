@@ -10,11 +10,13 @@ import os
 import socket
 import time
 from dataclasses import dataclass
+from datetime import datetime, time as clock_time
 from decimal import Decimal, InvalidOperation
 from typing import Any, Callable
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
 LOGGER = logging.getLogger("routesroads_price_bot")
@@ -200,10 +202,25 @@ def _chunk_messages(heading: str, items: list[str]) -> list[str]:
 
 
 class TelegramBot:
-    def __init__(self, token: str, site_url: str, allowed_chat_ids: set[int] | None) -> None:
+    def __init__(
+        self,
+        token: str,
+        site_url: str,
+        allowed_chat_ids: set[int] | None,
+        *,
+        target_chat_id: int | str | None = None,
+        target_message_thread_id: int | None = None,
+        schedule_time: clock_time | None = None,
+        timezone: ZoneInfo | None = None,
+    ) -> None:
         self.api_url = f"https://api.telegram.org/bot{token}"
         self.site_url = site_url
         self.allowed_chat_ids = allowed_chat_ids
+        self.target_chat_id = target_chat_id
+        self.target_message_thread_id = target_message_thread_id
+        self.schedule_time = schedule_time
+        self.timezone = timezone or ZoneInfo("Europe/Moscow")
+        self.last_scheduled_date: str | None = None
         self.offset = 0
 
     def api_call(self, method: str, data: dict[str, Any], *, timeout: int = 45) -> Any:
@@ -218,15 +235,62 @@ class TelegramBot:
             raise BotError(f"Telegram отклонил запрос: {payload.get('description', 'неизвестная ошибка')}")
         return payload.get("result")
 
-    def send_message(self, chat_id: int, text: str) -> None:
-        self.api_call(
-            "sendMessage",
-            {
-                "chat_id": chat_id,
-                "text": text,
-                "parse_mode": "HTML",
-                "disable_web_page_preview": "true",
-            },
+    def send_message(
+        self,
+        chat_id: int | str,
+        text: str,
+        *,
+        message_thread_id: int | None = None,
+    ) -> None:
+        data: dict[str, Any] = {
+            "chat_id": chat_id,
+            "text": text,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": "true",
+        }
+        if message_thread_id is not None:
+            data["message_thread_id"] = message_thread_id
+        self.api_call("sendMessage", data)
+
+    def report_destination(
+        self, source_chat_id: int, source_message_thread_id: int | None
+    ) -> tuple[int | str, int | None]:
+        if self.target_chat_id is not None:
+            return self.target_chat_id, self.target_message_thread_id
+        return source_chat_id, source_message_thread_id
+
+    def run_check(
+        self,
+        chat_id: int | str,
+        message_thread_id: int | None,
+        *,
+        intro: str,
+    ) -> None:
+        self.send_message(chat_id, intro, message_thread_id=message_thread_id)
+        try:
+            result = scan_zero_price_products(self.site_url)
+            for chunk in format_scan_result(result):
+                self.send_message(chat_id, chunk, message_thread_id=message_thread_id)
+        except BotError as exc:
+            LOGGER.exception("Catalog scan failed")
+            self.send_message(
+                chat_id,
+                f"❌ Проверка не завершена. {html.escape(str(exc))}",
+                message_thread_id=message_thread_id,
+            )
+
+    def send_location_help(self, chat_id: int, message_thread_id: int | None) -> None:
+        lines = [f"TARGET_CHAT_ID={chat_id}"]
+        if message_thread_id is not None:
+            lines.append(f"TARGET_MESSAGE_THREAD_ID={message_thread_id}")
+        else:
+            lines.append("# TARGET_MESSAGE_THREAD_ID не нужен: это не тема форума.")
+        self.send_message(
+            chat_id,
+            "<b>Настройки для этого места:</b>\n<pre>"
+            + html.escape("\n".join(lines))
+            + "</pre>",
+            message_thread_id=message_thread_id,
         )
 
     def handle_message(self, message: dict[str, Any]) -> None:
@@ -237,34 +301,73 @@ class TelegramBot:
             return
 
         command = text.strip().split(maxsplit=1)[0].lower().split("@", maxsplit=1)[0]
-        if command not in {"/start", "/check"}:
+        message_thread_id = message.get("message_thread_id")
+        if not isinstance(message_thread_id, int):
+            message_thread_id = None
+        if command not in {"/start", "/check", "/where"}:
             return
         if self.allowed_chat_ids is not None and chat_id not in self.allowed_chat_ids:
             self.send_message(chat_id, "⛔ У вас нет доступа к запуску этой проверки.")
             return
 
-        self.send_message(chat_id, "🔎 Начинаю проверку каталога routesandroads.fr…")
-        try:
-            result = scan_zero_price_products(self.site_url)
-            for chunk in format_scan_result(result):
-                self.send_message(chat_id, chunk)
-        except BotError as exc:
-            LOGGER.exception("Catalog scan failed")
-            self.send_message(chat_id, f"❌ Проверка не завершена. {html.escape(str(exc))}")
+        if command == "/where":
+            self.send_location_help(chat_id, message_thread_id)
+            return
+
+        destination_chat_id, destination_thread_id = self.report_destination(
+            chat_id, message_thread_id
+        )
+        if destination_chat_id != chat_id or destination_thread_id != message_thread_id:
+            self.send_message(chat_id, "🔎 Запускаю проверку. Результат будет отправлен в настроенный чат.")
+        self.run_check(
+            destination_chat_id,
+            destination_thread_id,
+            intro="🔎 Начинаю проверку каталога routesandroads.fr…",
+        )
+
+    def run_scheduled_check_if_due(self, now: datetime | None = None) -> None:
+        if self.target_chat_id is None or self.schedule_time is None:
+            return
+        now = now or datetime.now(self.timezone)
+        date_marker = now.date().isoformat()
+        if now.time().replace(tzinfo=None) < self.schedule_time:
+            return
+        if self.last_scheduled_date == date_marker:
+            return
+
+        self.last_scheduled_date = date_marker
+        LOGGER.info("Starting scheduled catalog scan for %s", self.target_chat_id)
+        self.run_check(
+            self.target_chat_id,
+            self.target_message_thread_id,
+            intro="🕘 <b>Ежедневная проверка каталога — 09:00 МСК</b>",
+        )
+
+    def poll_timeout(self) -> int:
+        if self.target_chat_id is None or self.schedule_time is None:
+            return 30
+        now = datetime.now(self.timezone)
+        scheduled_today = datetime.combine(now.date(), self.schedule_time, tzinfo=self.timezone)
+        seconds_until_schedule = (scheduled_today - now).total_seconds()
+        if 0 < seconds_until_schedule < 30:
+            return max(1, int(seconds_until_schedule))
+        return 30
 
     def run(self) -> None:
         me = self.api_call("getMe", {})
         LOGGER.info("Bot @%s started", me.get("username", "unknown"))
         while True:
             try:
+                self.run_scheduled_check_if_due()
+                timeout = self.poll_timeout()
                 updates = self.api_call(
                     "getUpdates",
                     {
                         "offset": self.offset,
-                        "timeout": 30,
+                        "timeout": timeout,
                         "allowed_updates": json.dumps(["message"]),
                     },
-                    timeout=40,
+                    timeout=timeout + 10,
                 )
                 for update in updates or []:
                     update_id = update.get("update_id")
@@ -287,6 +390,41 @@ def parse_allowed_chat_ids(raw_value: str | None) -> set[int] | None:
         raise SystemExit("ALLOWED_CHAT_IDS должен содержать только числа через запятую.") from exc
 
 
+def parse_target_chat_id(raw_value: str | None) -> int | str | None:
+    if not raw_value:
+        return None
+    value = raw_value.strip()
+    if not value:
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        if value.startswith("@"):
+            return value
+        raise SystemExit("TARGET_CHAT_ID должен быть числовым ID или @username канала.")
+
+
+def parse_optional_positive_int(raw_value: str | None, name: str) -> int | None:
+    if not raw_value:
+        return None
+    try:
+        value = int(raw_value)
+    except ValueError as exc:
+        raise SystemExit(f"{name} должен быть целым числом.") from exc
+    if value <= 0:
+        raise SystemExit(f"{name} должен быть положительным числом.")
+    return value
+
+
+def parse_schedule_time(raw_value: str | None) -> clock_time | None:
+    if not raw_value:
+        return None
+    try:
+        return datetime.strptime(raw_value, "%H:%M").time()
+    except ValueError as exc:
+        raise SystemExit("SCHEDULE_TIME должен быть в формате ЧЧ:ММ, например 09:00.") from exc
+
+
 def main() -> None:
     logging.basicConfig(
         level=os.getenv("LOG_LEVEL", "INFO").upper(),
@@ -297,7 +435,21 @@ def main() -> None:
         raise SystemExit("Не задана переменная TELEGRAM_BOT_TOKEN.")
     site_url = os.getenv("SITE_URL", DEFAULT_SITE_URL)
     allowed_chat_ids = parse_allowed_chat_ids(os.getenv("ALLOWED_CHAT_IDS"))
-    TelegramBot(token, site_url, allowed_chat_ids).run()
+    try:
+        timezone = ZoneInfo(os.getenv("SCHEDULE_TIMEZONE", "Europe/Moscow"))
+    except ZoneInfoNotFoundError as exc:
+        raise SystemExit("Не найден часовой пояс SCHEDULE_TIMEZONE.") from exc
+    TelegramBot(
+        token,
+        site_url,
+        allowed_chat_ids,
+        target_chat_id=parse_target_chat_id(os.getenv("TARGET_CHAT_ID")),
+        target_message_thread_id=parse_optional_positive_int(
+            os.getenv("TARGET_MESSAGE_THREAD_ID"), "TARGET_MESSAGE_THREAD_ID"
+        ),
+        schedule_time=parse_schedule_time(os.getenv("SCHEDULE_TIME", "09:00")),
+        timezone=timezone,
+    ).run()
 
 
 if __name__ == "__main__":
