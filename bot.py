@@ -229,7 +229,14 @@ class TelegramBot:
         try:
             with urlopen(request, timeout=timeout) as response:
                 payload = json.load(response)
-        except (HTTPError, URLError, TimeoutError, socket.timeout, json.JSONDecodeError) as exc:
+        except HTTPError as exc:
+            try:
+                error_payload = json.load(exc)
+                description = error_payload.get("description", f"HTTP {exc.code}")
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                description = f"HTTP {exc.code}"
+            raise BotError(f"Telegram отклонил запрос: {description}") from exc
+        except (URLError, TimeoutError, socket.timeout, json.JSONDecodeError) as exc:
             raise BotError("Ошибка связи с Telegram.") from exc
         if not payload.get("ok"):
             raise BotError(f"Telegram отклонил запрос: {payload.get('description', 'неизвестная ошибка')}")
@@ -266,18 +273,21 @@ class TelegramBot:
         *,
         intro: str,
     ) -> None:
-        self.send_message(chat_id, intro, message_thread_id=message_thread_id)
         try:
+            self.send_message(chat_id, intro, message_thread_id=message_thread_id)
             result = scan_zero_price_products(self.site_url)
             for chunk in format_scan_result(result):
                 self.send_message(chat_id, chunk, message_thread_id=message_thread_id)
         except BotError as exc:
             LOGGER.exception("Catalog scan failed")
-            self.send_message(
-                chat_id,
-                f"❌ Проверка не завершена. {html.escape(str(exc))}",
-                message_thread_id=message_thread_id,
-            )
+            try:
+                self.send_message(
+                    chat_id,
+                    f"❌ Проверка не завершена. {html.escape(str(exc))}",
+                    message_thread_id=message_thread_id,
+                )
+            except BotError:
+                LOGGER.exception("Could not send the error report")
 
     def send_location_help(self, chat_id: int, message_thread_id: int | None) -> None:
         lines = [f"TARGET_CHAT_ID={chat_id}"]

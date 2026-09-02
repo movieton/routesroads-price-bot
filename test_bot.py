@@ -3,6 +3,7 @@ from datetime import datetime, time
 from zoneinfo import ZoneInfo
 
 from bot import (
+    BotError,
     ScanResult,
     TelegramBot,
     ZeroPriceProduct,
@@ -132,6 +133,14 @@ class ScannerTests(unittest.TestCase):
     def test_ignores_blank_message(self):
         bot = TelegramBot("token", "https://example.com", None)
         bot.handle_message({"chat": {"id": 123}, "text": "   "})
+
+    def test_scan_delivery_failure_does_not_stop_polling_loop(self):
+        bot = TelegramBot("token", "https://example.com", None)
+        bot.send_message = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            BotError("No permission")
+        )
+
+        bot.run_check(123, None, intro="Test")
 
 
 if __name__ == "__main__":
