@@ -300,7 +300,10 @@ class TelegramBot:
         if not isinstance(chat_id, int) or not isinstance(text, str):
             return
 
-        command = text.strip().split(maxsplit=1)[0].lower().split("@", maxsplit=1)[0]
+        command_parts = text.strip().split(maxsplit=1)
+        if not command_parts:
+            return
+        command = command_parts[0].lower().split("@", maxsplit=1)[0]
         message_thread_id = message.get("message_thread_id")
         if not isinstance(message_thread_id, int):
             message_thread_id = None

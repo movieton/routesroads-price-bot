@@ -129,6 +129,10 @@ class ScannerTests(unittest.TestCase):
         self.assertEqual(parse_target_chat_id("@routesroads_channel"), "@routesroads_channel")
         self.assertEqual(parse_schedule_time("09:00"), time(9, 0))
 
+    def test_ignores_blank_message(self):
+        bot = TelegramBot("token", "https://example.com", None)
+        bot.handle_message({"chat": {"id": 123}, "text": "   "})
+
 
 if __name__ == "__main__":
     unittest.main()
